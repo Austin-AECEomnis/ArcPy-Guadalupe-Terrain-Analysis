@@ -1,0 +1,112 @@
+import arcpy
+import os
+from arcpy.sa import Slope, FlowDirection, FlowAccumulation
+
+# ============================================================
+# GUADALUPE CORRIDOR — 107 STRUCTURES TERRAIN ANALYSIS v3
+# Clips DEM to buffered FEMA flood zone before terrain analysis
+# Buffer distance: 3000 feet on all sides of flood zone extent
+# Original workflow used Kerr County parcel selection as mask —
+# buffered flood zone replicates that corridor extent without
+# requiring parcel data. Substitute any study area boundary here.
+# ============================================================
+
+gdb = r"C:\GIS_Projects\KendallCounty_FloodAnalysis\KendallCounty_FloodAnalysis.gdb"
+dem = r"C:\GIS_Projects\KendallCounty_FloodAnalysis\GuadDem.tif"
+
+# Inputs
+flood_zone = os.path.join(gdb, "Kendall_FloodZones")
+structures_255 = os.path.join(gdb, "Structures_255_points")
+
+# Outputs
+buffer_out = os.path.join(gdb, "Auto_FloodZone_3000ft_Buffer")
+dem_clipped = os.path.join(gdb, "Auto_DEM_Clipped")
+slope_out = os.path.join(gdb, "Auto_Slope")
+flowdir_out = os.path.join(gdb, "Auto_FlowDir")
+flowacc_out = os.path.join(gdb, "Auto_FlowAcc")
+slope_values_out = os.path.join(gdb, "Auto_Slope_Values")
+slope_match_out = os.path.join(gdb, "Auto_Slope_Match")
+structures_107 = os.path.join(gdb, "Auto_High_Risk_107_Structures")
+
+arcpy.env.workspace = gdb
+arcpy.env.overwriteOutput = True
+
+# Check Spatial Analyst
+if arcpy.CheckExtension("Spatial") == "Available":
+    arcpy.CheckOutExtension("Spatial")
+    print("Spatial Analyst checked out.")
+else:
+    print("ERROR: Spatial Analyst not available.")
+    raise SystemExit
+
+# --- STEP 1: Buffer flood zone by 3000 feet ---
+print("Step 1 of 7: Buffering flood zone by 3000 feet...")
+arcpy.analysis.Buffer(
+    flood_zone,
+    buffer_out,
+    "3000 Feet",
+    "FULL",
+    "ROUND",
+    "ALL"
+)
+print(f"  Buffer saved: {buffer_out}")
+
+# --- STEP 2: Clip DEM to buffered flood zone ---
+print("Step 2 of 7: Clipping DEM to buffered extent...")
+clipped = arcpy.sa.ExtractByMask(dem, buffer_out)
+clipped.save(dem_clipped)
+print(f"  Clipped DEM saved: {dem_clipped}")
+
+# --- STEP 3: Slope ---
+print("Step 3 of 7: Generating Slope from clipped DEM...")
+slope_raster = Slope(dem_clipped, "DEGREE")
+slope_raster.save(slope_out)
+print(f"  Slope saved: {slope_out}")
+
+# --- STEP 4: Flow Direction ---
+print("Step 4 of 7: Generating Flow Direction...")
+flowdir_raster = FlowDirection(dem_clipped, "NORMAL")
+flowdir_raster.save(flowdir_out)
+print(f"  Flow Direction saved: {flowdir_out}")
+
+# --- STEP 5: Flow Accumulation ---
+print("Step 5 of 7: Generating Flow Accumulation...")
+flowacc_raster = FlowAccumulation(flowdir_raster)
+flowacc_raster.save(flowacc_out)
+print(f"  Flow Accumulation saved: {flowacc_out}")
+
+# --- STEP 6: Extract slope and flow acc values to 255 points ---
+print("Step 6 of 7: Extracting terrain values to structure points...")
+arcpy.management.CopyFeatures(structures_255, slope_values_out)
+arcpy.sa.ExtractMultiValuesToPoints(
+    slope_values_out,
+    [[slope_out, "SLOPE_VAL"], [flowacc_out, "FLOWACC_VAL"]],
+    "NONE"
+)
+print(f"  Terrain values extracted: {slope_values_out}")
+
+# --- STEP 7: Two-pass terrain signature filter ---
+print("Step 7 of 7: Applying two-pass terrain signature filter...")
+
+# Pass 1 — Slope ceiling 3.3563 degrees (~114 structures expected)
+arcpy.management.MakeFeatureLayer(slope_values_out, "lyr_slope")
+arcpy.management.SelectLayerByAttribute(
+    "lyr_slope", "NEW_SELECTION", "SLOPE_VAL <= 3.3563"
+)
+slope_count = int(arcpy.management.GetCount("lyr_slope")[0])
+arcpy.management.CopyFeatures("lyr_slope", slope_match_out)
+print(f"  Pass 1 - Slope filter: {slope_count} structures (expected ~114)")
+
+# Pass 2 — Flow accumulation ceiling 33 cells (~107 structures expected)
+arcpy.management.MakeFeatureLayer(slope_match_out, "lyr_107")
+arcpy.management.SelectLayerByAttribute(
+    "lyr_107", "NEW_SELECTION", "FLOWACC_VAL <= 33"
+)
+final_count = int(arcpy.management.GetCount("lyr_107")[0])
+arcpy.management.CopyFeatures("lyr_107", structures_107)
+print(f"  Pass 2 - Flow accumulation filter: {final_count} structures (expected 107)")
+
+arcpy.CheckInExtension("Spatial")
+print("\nScript complete.")
+print(f"Final output: {structures_107}")
+print(f"Final structure count: {final_count}")
